@@ -8,59 +8,39 @@
 #![no_std]
 #![no_main]
 
-use embedded_hal::digital::v2::{InputPin, OutputPin};
+use embedded_hal::digital::v2::InputPin;
+use embedded_hal::{digital::v2::OutputPin, spi::MODE_0};
 use embedded_time::rate::*;
-use hal::gpio::{FunctionSpi, Output, PushPull, Spi};
 use hal::spi::{Enabled, SpiDevice};
+use hal::Timer;
 use mfrc522::Mfrc522;
 use panic_halt as _;
-use rp2040_hal::spi::Spi;
+use rp2040_hal::{gpio::FunctionSpi, pac, spi::Spi};
 use rp_pico::entry;
-use rp_pico::hal::{self, pac, prelude::*};
+use rp_pico::hal::{self, prelude::*};
 use usbd_serial::SerialPort;
 
 // USB Device support
-use core::fmt::Write;
 use usb_device::{class_prelude::*, prelude::*};
 
 fn cards<'a>() -> [&'a [u8]; 11] {
-    let cards = [
-        [35, 188, 68, 167],
-        [243, 172, 67, 167],
-        [147, 204, 155, 167],
-        [227, 164, 122, 167],
-    ];
-    let transponders = [
-        [64, 107, 20, 27],
-        [144, 109, 125, 34],
-        [18, 95, 211, 27],
-        [97, 51, 50, 39],
-    ];
-    let aaron = [4, 29, 61, 74, 27, 92, 128];
-    let valle = [4, 27, 16, 74, 83, 102, 128];
-    let dennis = [4, 49, 21, 178, 51, 92, 128];
     [
-        &[35, 188, 68, 167],
-        &[243, 172, 67, 167],
-        &[147, 204, 155, 167],
-        &[227, 164, 122, 167],
-        &[64, 107, 20, 27],
-        &[144, 109, 125, 34],
-        &[18, 95, 211, 27],
-        &[97, 51, 50, 39],
-        &[4, 29, 61, 74, 27, 92, 128],
-        &[4, 27, 16, 74, 83, 102, 128],
-        &[4, 49, 21, 178, 51, 92, 128],
+        &[35, 188, 68, 167],            // A
+        &[243, 172, 67, 167],           // B
+        &[147, 204, 155, 167],          // C
+        &[227, 164, 122, 167],          // D
+        &[64, 107, 20, 27],             // A
+        &[144, 109, 125, 34],           // B
+        &[18, 95, 211, 27],             // C
+        &[97, 51, 50, 39],              // D
+        &[4, 29, 61, 74, 27, 92, 128],  // Aaron
+        &[4, 27, 16, 74, 83, 102, 128], // Valle
+        &[4, 49, 21, 178, 51, 92, 128], // Dennis
     ]
 }
-fn check_rfid<D: SpiDevice>(mfrc: Mfrc522<Spi<Enabled, D, 8>, Output<PushPull>>) -> bool {
+fn check_rfid<D: SpiDevice, NSS: OutputPin>(mfrc: &mut Mfrc522<Spi<Enabled, D, 8>, NSS>) -> bool {
     if let Ok(atqa) = mfrc.reqa() {
         if let Ok(uid) = mfrc.select(&atqa) {
-            let mut buf = [0u8; 64];
-            /*let _ = match write_to::show(&mut buf, format_args!("uid: {:?}\r\n", &uid.as_bytes())) {
-                Ok(uid) => serial.write(uid.as_bytes()),
-                Err(_) => serial.write(b"uid to long for buffer\r\n"),
-            };*/
             return cards().iter().any(|id| id == &uid.as_bytes());
         }
     }
@@ -109,14 +89,6 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    use embedded_hal::spi::MODE_0;
-    use embedded_time::rate::*;
-    use rp2040_hal::{
-        gpio::{FunctionSpi, Pins},
-        pac,
-        spi::Spi,
-    };
-
     let _ = pins.gpio2.into_mode::<FunctionSpi>();
     let _ = pins.gpio3.into_mode::<FunctionSpi>();
     let _ = pins.gpio4.into_mode::<FunctionSpi>();
@@ -128,23 +100,15 @@ fn main() -> ! {
         &MODE_0,
     );
 
-    /*let spi = Spi::<_, _, 8>::new(pac.SPI0).init(
-        &mut pac.RESETS,
-        clocks.peripheral_clock.freq(),
-        1_000_000u32.Hz(),
-        &embedded_hal::spi::MODE_0,
-    );*/
-
     let nss_pin = pins.gpio1.into_push_pull_output();
     let mut mfrc = Mfrc522::new(spi, nss_pin).unwrap();
 
     let mut summer_pin = pins.gpio22.into_push_pull_output();
-    let mut door = pins.gpio28.into_pull_up_input();
-    summer_pin.set_low();
+    let door = pins.gpio28.into_pull_up_input();
 
     let mut state = State::Armed;
-    const SUMMER_INTERVAL: u32 = 500;
-    // Set up the USB Communications Class Device driver
+    const SNOOZE_INTERVAL: u64 = 1_000_000 * 10; //10 seconds
+                                                 // Set up the USB Communications Class Device driver
     let mut serial = SerialPort::new(&usb_bus);
     // Set the LED to be an output
     let mut led = pins.led.into_push_pull_output();
@@ -158,19 +122,65 @@ fn main() -> ! {
         .build();
 
     //watchdog.start(1_050_000.microseconds());
+    let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
 
-    let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
     let mut said_hello = false;
     loop {
         // A welcome message at the beginning
         if !said_hello && timer.get_counter() >= 10_000 {
             said_hello = true;
-            let _ = serial.write(b"Test 6AcAb?\r\n");
+            let _ = serial.write(b"Hello 1, World!\r\n");
         }
 
-        //let _ = serial.write(b"no mfrc connected\r\n");
-        let _ = serial.flush();
-
+        //let auth = check_rfid(&mut mfrc);
+        let door_is_open = door.is_high().unwrap();
+        match door_is_open {
+            true => serial.write(b"o"),
+            false => serial.write(b"c"),
+        };
+        /*state = match state {
+            State::Armed => match (auth, door_is_open) {
+                (true, _) => State::Snoozed(timer.get_counter()),
+                (false, false) => State::Armed,
+                (false, true) => State::Alarming,
+            },
+            State::Snoozed(timestamp) => {
+                if timer.get_counter() - timestamp > SNOOZE_INTERVAL {
+                    //blink
+                    serial.write(b"blink").unwrap();
+                    State::Armed
+                } else if door_is_open {
+                    State::Disarmed
+                } else if auth {
+                    //blink
+                    serial.write(b"blink").unwrap();
+                    State::Snoozed(timer.get_counter())
+                } else {
+                    State::Snoozed(timestamp)
+                }
+            }
+            State::Disarmed => {
+                if !door_is_open {
+                    //blink
+                    serial.write(b"blink").unwrap();
+                    State::Snoozed(timer.get_counter())
+                } else {
+                    State::Disarmed
+                }
+            }
+            State::Alarming => {
+                if auth {
+                    summer_pin.set_low().unwrap();
+                    State::Disarmed
+                } else {
+                    //handle alarm here
+                    summer_pin.set_high().unwrap();
+                    //blink
+                    serial.write(b"blink").unwrap();
+                    State::Alarming
+                }
+            }
+        };*/
         // Check for new data
         if usb_dev.poll(&mut [&mut serial]) {
             let mut buf = [0u8; 64];
@@ -184,12 +194,12 @@ fn main() -> ! {
                 Ok(count) => {
                     // Convert to upper case
                     buf.iter_mut().take(count).for_each(|b| {
-                        b.make_ascii_lowercase();
+                        b.make_ascii_uppercase();
                     });
 
-                    if buf.contains(&b'1') {
+                    if buf.contains(&('1' as u8)) {
                         led.set_high().unwrap();
-                    } else if buf.contains(&b'0') {
+                    } else if buf.contains(&('0' as u8)) {
                         led.set_low().unwrap();
                     }
                     // Send back to the host
@@ -206,15 +216,14 @@ fn main() -> ! {
                 }
             }
         }
-        mfrc.hlta();
-        mfrc.stop_crypto1();
+        //mfrc.hlta();
     }
 }
 
 enum State {
     Armed,
-    Snoozed(u32),
-    Alarming(u32, bool),
+    Snoozed(u64),
+    Alarming,
     Disarmed,
 }
 
