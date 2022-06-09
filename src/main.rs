@@ -27,30 +27,29 @@ use usb_device::{class_prelude::*, prelude::*};
 
 macro_rules! print_serial {
     ($($arg:tt)*) => {
-        unsafe {
-            if let Ok(msg) = write_to::show(&mut [0u8; 128], format_args!($($arg)*)) {
-                let _ = SERIAL.as_mut().map(|s|s.write(msg.as_bytes()));
-            }
+        if let Ok(msg) = write_to::show(&mut [0u8; 1024], format_args!($($arg)*)) {
+            let _ = unsafe {SERIAL.as_mut()}.map(|s|s.write(msg.as_bytes()));
         }
     };
 }
 
-fn cards<'a>() -> [&'a [u8]; 11] {
+fn cards<'a>() -> [&'a [u8]; 12] {
     [
-        &[35, 188, 68, 167],            // A
-        &[243, 172, 67, 167],           // B
-        &[147, 204, 155, 167],          // C
-        &[227, 164, 122, 167],          // D
-        &[64, 107, 20, 27],             // A
-        &[144, 109, 125, 34],           // B
-        &[18, 95, 211, 27],             // C
-        &[97, 51, 50, 39],              // D
-        &[4, 29, 61, 74, 27, 92, 128],  // Aaron
-        &[4, 27, 16, 74, 83, 102, 128], // Valle
-        &[4, 49, 21, 178, 51, 92, 128], // Dennis
+        &[35, 188, 68, 167],   // A
+        &[243, 172, 67, 167],  // B
+        &[147, 204, 155, 167], // C
+        &[227, 164, 122, 167], // D
+        &[64, 107, 20, 27],    // A transponder
+        &[144, 109, 125, 34],  // B
+        &[18, 95, 211, 27],    // C
+        &[97, 51, 50, 39],     // D
     ]
 }
-fn check_rfid<D: SpiDevice, NSS: OutputPin>(mfrc: &mut Mfrc522<Spi<Enabled, D, 8>, NSS>) -> bool {
+fn check_rfid<D: SpiDevice, NSS: OutputPin, RST: OutputPin>(
+    mfrc: &mut Mfrc522<Spi<Enabled, D, 8>, NSS>,
+    reset: &mut RST,
+) -> bool {
+    let _ = reset.set_high();
     match mfrc.reqa() {
         Ok(atqa) => {
             if let Ok(uid) = mfrc.select(&atqa) {
@@ -58,8 +57,12 @@ fn check_rfid<D: SpiDevice, NSS: OutputPin>(mfrc: &mut Mfrc522<Spi<Enabled, D, 8
                 return cards().iter().any(|id| id == &uid.as_bytes());
             }
         }
+        /*Err(mfrc522::Error::Timeout | mfrc522::Error::Collision) => {
+            //let _ = reset.set_low();
+        }*/
+        Err(mfrc522::Error::Timeout) => {}
         Err(error) => {
-            print_serial!("{:?}", error);
+            print_serial!("Rfid error: {:?}\r\n", error);
         }
     }
     false
@@ -94,8 +97,6 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
-
     // Set up the USB driver
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
         pac.USBCTRL_REGS,
@@ -125,18 +126,40 @@ fn main() -> ! {
     let _ = pins.gpio3.into_mode::<FunctionSpi>();
     let _ = pins.gpio4.into_mode::<FunctionSpi>();
 
-    let spi = Spi::<_, _, 8>::new(pac.SPI0).init(
+    let _ = pins.gpio10.into_mode::<FunctionSpi>();
+    let _ = pins.gpio11.into_mode::<FunctionSpi>();
+    let _ = pins.gpio12.into_mode::<FunctionSpi>();
+
+    let spi1 = Spi::<_, _, 8>::new(pac.SPI0).init(
+        &mut pac.RESETS,
+        clocks.peripheral_clock.freq(),
+        1_000_000u32.Hz(),
+        &MODE_0,
+    );
+    let spi2 = Spi::<_, _, 8>::new(pac.SPI1).init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
         1_000_000u32.Hz(),
         &MODE_0,
     );
 
-    let nss_pin = pins.gpio1.into_push_pull_output();
-    let mut mfrc = Mfrc522::new(spi, nss_pin).unwrap();
+    let mut rst1_pin = pins.gpio0.into_push_pull_output();
+    let nss1_pin = pins.gpio1.into_push_pull_output();
+    let mut rst2_pin = pins.gpio8.into_push_pull_output();
+    let nss2_pin = pins.gpio13.into_push_pull_output();
+
+    rst1_pin.set_high().unwrap();
+    rst2_pin.set_high().unwrap();
+
+    let mut mfrc1 = Mfrc522::new(spi1, nss1_pin).unwrap();
+    let mut mfrc2 = Mfrc522::new(spi2, nss2_pin).unwrap();
+
+    let mut check_any_rfid =
+        || check_rfid(&mut mfrc1, &mut rst1_pin) || check_rfid(&mut mfrc2, &mut rst2_pin);
 
     let mut summer_pin = pins.gpio22.into_push_pull_output();
     let door = pins.gpio28.into_pull_up_input();
+    let mut armed_indicator_led_pin = pins.gpio15.into_push_pull_output();
 
     let mut state = State::Armed;
     const SNOOZE_INTERVAL: u64 = 1_000_000 * 10; //10 seconds
@@ -144,7 +167,7 @@ fn main() -> ! {
     let mut led = pins.led.into_push_pull_output();
 
     // Create a USB device with a fake VID and PID
-    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
+    let mut usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x16c0, 0x27dd))
         .manufacturer("Fake company")
         .product("Serial port")
         .serial_number("TEST")
@@ -154,56 +177,50 @@ fn main() -> ! {
     //watchdog.start(1_050_000.microseconds());
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
 
-    let mut said_hello = false;
     let mut last_timer = 0;
-    delay.delay_ms(0);
     loop {
-        // A welcome message at the beginning
-        /*if !said_hello && timer.get_counter() >= 2_000_000 {
-            said_hello = true;
-            print_serial!("Hello 1");
-            print_serial!("{:?}", mfrc.check_error_register());
-        }*/
-
-        //led.set_high();
         let door_is_open = door.is_high().unwrap();
-        /*match door_is_open {
-            true => print_serial!("o"),
-            false => print_serial!("c"),
-        };*/
+        let auth = check_any_rfid();
+
         watchdog.feed();
-        if timer.get_counter() - last_timer > 500_000 {
+        if timer.get_counter() - last_timer > 1_000_000 {
             last_timer = timer.get_counter();
-            //let auth = check_rfid(&mut mfrc);
-            delay.delay_ms(20);
+            //print_serial!("{state:?}\r");
         }
-        delay.delay_ms(20);
-        /*state = match state {
-            State::Armed => match (auth, door_is_open) {
-                (true, _) => State::Snoozed(timer.get_counter()),
-                (false, false) => State::Armed,
-                (false, true) => State::Alarming,
-            },
+        // Check for new data
+        state = match state {
+            State::Armed => {
+                led.set_high().unwrap();
+                armed_indicator_led_pin.set_high().unwrap();
+
+                match (auth, door_is_open) {
+                    (true, _) => State::Snoozed(timer.get_counter() + SNOOZE_INTERVAL),
+                    (false, false) => State::Armed,
+                    (false, true) => State::Alarming,
+                }
+            }
             State::Snoozed(timestamp) => {
-                if timer.get_counter() - timestamp > SNOOZE_INTERVAL {
-                    //blink
-                    serial.write(b"blink").unwrap();
+                led.set_low().unwrap();
+                armed_indicator_led_pin.set_low().unwrap();
+
+                if timer.get_counter() > timestamp {
+                    print_serial!("arming alarm\r\n");
                     State::Armed
                 } else if door_is_open {
                     State::Disarmed
                 } else if auth {
-                    //blink
-                    serial.write(b"blink").unwrap();
-                    State::Snoozed(timer.get_counter())
+                    State::Snoozed(timer.get_counter() + SNOOZE_INTERVAL)
                 } else {
                     State::Snoozed(timestamp)
                 }
             }
             State::Disarmed => {
+                led.set_low().unwrap();
+                armed_indicator_led_pin.set_low().unwrap();
+
                 if !door_is_open {
-                    //blink
-                    serial.write(b"blink").unwrap();
-                    State::Snoozed(timer.get_counter())
+                    print_serial!("door closed,snoozing");
+                    State::Snoozed(timer.get_counter() + 2_000_000)
                 } else {
                     State::Disarmed
                 }
@@ -215,14 +232,10 @@ fn main() -> ! {
                 } else {
                     //handle alarm here
                     summer_pin.set_high().unwrap();
-                    //blink
-                    serial.write(b"blink").unwrap();
                     State::Alarming
                 }
             }
-        };*/
-        // Check for new data
-
+        };
         if usb_dev.poll(&mut [serial]) {
             let mut buf = [0u8; 64];
             match serial.read(&mut buf) {
@@ -237,15 +250,14 @@ fn main() -> ! {
                     buf.iter_mut().take(count).for_each(|b| {
                         b.make_ascii_uppercase();
                     });
-                    let auth = check_rfid(&mut mfrc);
 
-                    if buf.contains(&('1' as u8)) {
+                    if buf.contains(&b'1') {
                         led.set_high().unwrap();
-                    } else if buf.contains(&('0' as u8)) {
+                    } else if buf.contains(&b'0') {
                         led.set_low().unwrap();
                     }
                     // Send back to the host
-                    let mut wr_ptr = &buf[..count];
+                    /*let mut wr_ptr = &buf[..count];
                     while !wr_ptr.is_empty() {
                         print_serial!("{}\r\n", timer.get_counter());
                         match serial.write(wr_ptr) {
@@ -255,7 +267,7 @@ fn main() -> ! {
                             // write buffer is full.
                             Err(_) => break,
                         };
-                    }
+                    }*/
                 }
             }
         }
@@ -263,6 +275,7 @@ fn main() -> ! {
     }
 }
 
+#[derive(Debug)]
 enum State {
     Armed,
     Snoozed(u64),
