@@ -8,9 +8,11 @@
 #![no_std]
 #![no_main]
 
-use embedded_hal::digital::v2::InputPin;
-use embedded_hal::{digital::v2::OutputPin, spi::MODE_0};
-use embedded_time::rate::*;
+use embedded_hal::{
+    digital::v2::{InputPin, OutputPin},
+    spi::MODE_0,
+};
+use embedded_time::{duration::Extensions, rate::*};
 use hal::spi::{Enabled, SpiDevice};
 use hal::Timer;
 use mfrc522::Mfrc522;
@@ -22,6 +24,16 @@ use usbd_serial::SerialPort;
 
 // USB Device support
 use usb_device::{class_prelude::*, prelude::*};
+
+macro_rules! print_serial {
+    ($($arg:tt)*) => {
+        unsafe {
+            if let Ok(msg) = write_to::show(&mut [0u8; 128], format_args!($($arg)*)) {
+                let _ = SERIAL.as_mut().map(|s|s.write(msg.as_bytes()));
+            }
+        }
+    };
+}
 
 fn cards<'a>() -> [&'a [u8]; 11] {
     [
@@ -39,21 +51,33 @@ fn cards<'a>() -> [&'a [u8]; 11] {
     ]
 }
 fn check_rfid<D: SpiDevice, NSS: OutputPin>(mfrc: &mut Mfrc522<Spi<Enabled, D, 8>, NSS>) -> bool {
-    if let Ok(atqa) = mfrc.reqa() {
-        if let Ok(uid) = mfrc.select(&atqa) {
-            return cards().iter().any(|id| id == &uid.as_bytes());
+    match mfrc.reqa() {
+        Ok(atqa) => {
+            if let Ok(uid) = mfrc.select(&atqa) {
+                print_serial!("{:?}", uid.as_bytes());
+                return cards().iter().any(|id| id == &uid.as_bytes());
+            }
+        }
+        Err(error) => {
+            print_serial!("{:?}", error);
         }
     }
     false
 }
+static mut SERIAL: Option<SerialPort<'_, rp2040_hal::usb::UsbBus>> = None;
+static mut USB_BUS: Option<usb_device::bus::UsbBusAllocator<rp2040_hal::usb::UsbBus>> = None;
 
 #[entry]
 fn main() -> ! {
     // Grab our singleton objects
     let mut pac = pac::Peripherals::take().unwrap();
+    let core = pac::CorePeripherals::take().unwrap();
 
     // Set up the watchdog driver - needed by the clock setup code
-    let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
+    use embedded_hal::watchdog::*;
+    let mut watchdog = hal::watchdog::Watchdog::new(pac.WATCHDOG);
+
+    watchdog.start(4_000_000u32.microseconds());
 
     // Configure the clocks
     //
@@ -70,6 +94,8 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
+
     // Set up the USB driver
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
         pac.USBCTRL_REGS,
@@ -78,6 +104,12 @@ fn main() -> ! {
         true,
         &mut pac.RESETS,
     ));
+    unsafe { USB_BUS = Some(usb_bus) };
+    let usb_bus = unsafe { USB_BUS.as_mut().unwrap() };
+
+    let serial = SerialPort::new(unsafe { USB_BUS.as_ref().unwrap() });
+    unsafe { SERIAL = Some(serial) };
+    let serial = unsafe { SERIAL.as_mut().unwrap() };
 
     let sio = hal::Sio::new(pac.SIO);
 
@@ -108,9 +140,7 @@ fn main() -> ! {
 
     let mut state = State::Armed;
     const SNOOZE_INTERVAL: u64 = 1_000_000 * 10; //10 seconds
-                                                 // Set up the USB Communications Class Device driver
-    let mut serial = SerialPort::new(&usb_bus);
-    // Set the LED to be an output
+                                                 // Set the LED to be an output
     let mut led = pins.led.into_push_pull_output();
 
     // Create a USB device with a fake VID and PID
@@ -125,19 +155,29 @@ fn main() -> ! {
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
 
     let mut said_hello = false;
+    let mut last_timer = 0;
+    delay.delay_ms(0);
     loop {
         // A welcome message at the beginning
-        if !said_hello && timer.get_counter() >= 10_000 {
+        /*if !said_hello && timer.get_counter() >= 2_000_000 {
             said_hello = true;
-            let _ = serial.write(b"Hello 1, World!\r\n");
-        }
+            print_serial!("Hello 1");
+            print_serial!("{:?}", mfrc.check_error_register());
+        }*/
 
-        //let auth = check_rfid(&mut mfrc);
+        //led.set_high();
         let door_is_open = door.is_high().unwrap();
-        match door_is_open {
-            true => serial.write(b"o"),
-            false => serial.write(b"c"),
-        };
+        /*match door_is_open {
+            true => print_serial!("o"),
+            false => print_serial!("c"),
+        };*/
+        watchdog.feed();
+        if timer.get_counter() - last_timer > 500_000 {
+            last_timer = timer.get_counter();
+            //let auth = check_rfid(&mut mfrc);
+            delay.delay_ms(20);
+        }
+        delay.delay_ms(20);
         /*state = match state {
             State::Armed => match (auth, door_is_open) {
                 (true, _) => State::Snoozed(timer.get_counter()),
@@ -182,7 +222,8 @@ fn main() -> ! {
             }
         };*/
         // Check for new data
-        if usb_dev.poll(&mut [&mut serial]) {
+
+        if usb_dev.poll(&mut [serial]) {
             let mut buf = [0u8; 64];
             match serial.read(&mut buf) {
                 Err(_e) => {
@@ -196,6 +237,7 @@ fn main() -> ! {
                     buf.iter_mut().take(count).for_each(|b| {
                         b.make_ascii_uppercase();
                     });
+                    let auth = check_rfid(&mut mfrc);
 
                     if buf.contains(&('1' as u8)) {
                         led.set_high().unwrap();
@@ -205,6 +247,7 @@ fn main() -> ! {
                     // Send back to the host
                     let mut wr_ptr = &buf[..count];
                     while !wr_ptr.is_empty() {
+                        print_serial!("{}\r\n", timer.get_counter());
                         match serial.write(wr_ptr) {
                             Ok(len) => wr_ptr = &wr_ptr[len..],
                             // On error, just drop unwritten data.

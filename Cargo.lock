@@ -445,8 +445,6 @@ checksum = "2dffe52ecf27772e601905b7522cb4ef790d2cc203488bbd0e2fe85fcb74566d"
 [[package]]
 name = "mfrc522"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c244e830b46c23e008771dcbb5d5bbe71b9e3d78c3ad65bb715ce5f2306214e"
 dependencies = [
  "embedded-hal",
 ]

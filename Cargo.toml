@@ -16,7 +16,7 @@ rp-pico = "0.3"
 usbd-serial = "0.1.1"
 usbd-hid = "0.5.1"
 futures = { version = "0.3", default-features = false, optional = true }
-mfrc522 = "0.3.0"
+mfrc522 = {path = "rfid-rs"}
 embedded-hal ="0.2.5"
 panic-halt= "0.2.0"
 
