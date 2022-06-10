@@ -8,6 +8,7 @@
 #![no_std]
 #![no_main]
 
+use cortex_m::delay::Delay;
 use embedded_hal::{
     digital::v2::{InputPin, OutputPin},
     spi::MODE_0,
@@ -33,27 +34,33 @@ macro_rules! print_serial {
     };
 }
 
-fn cards<'a>() -> [&'a [u8]; 12] {
+fn cards<'a>() -> [&'a [u8]; 13] {
     [
-        &[35, 188, 68, 167],   // A
-        &[243, 172, 67, 167],  // B
-        &[147, 204, 155, 167], // C
-        &[227, 164, 122, 167], // D
-        &[64, 107, 20, 27],    // A transponder
-        &[144, 109, 125, 34],  // B
-        &[18, 95, 211, 27],    // C
-        &[97, 51, 50, 39],     // D
+        &[35, 188, 68, 167],             // A
+        &[243, 172, 67, 167],            // B
+        &[147, 204, 155, 167],           // C
+        &[227, 164, 122, 167],           // D
+        &[64, 107, 20, 27],              // A
+        &[144, 109, 125, 34],            // B
+        &[18, 95, 211, 27],              // C
+        &[97, 51, 50, 39],               // D
+        &[4, 29, 61, 74, 27, 92, 128],   // Aaron
+        &[4, 27, 16, 74, 83, 102, 128],  // Valle
+        &[4, 49, 21, 178, 51, 92, 128],  // Dennis
+        &[4, 43, 39, 218, 123, 68, 128], // Valle Transponder
+        &[4, 61, 33, 90, 27, 92, 128],   // Tobias
     ]
 }
 fn check_rfid<D: SpiDevice, NSS: OutputPin, RST: OutputPin>(
     mfrc: &mut Mfrc522<Spi<Enabled, D, 8>, NSS>,
     reset: &mut RST,
+    delay: &mut Delay,
 ) -> bool {
     let _ = reset.set_high();
-    match mfrc.reqa() {
+    match mfrc.new_card_present() {
         Ok(atqa) => {
             if let Ok(uid) = mfrc.select(&atqa) {
-                print_serial!("{:?}", uid.as_bytes());
+                //print_serial!("{:?}", uid.as_bytes());
                 return cards().iter().any(|id| id == &uid.as_bytes());
             }
         }
@@ -61,8 +68,17 @@ fn check_rfid<D: SpiDevice, NSS: OutputPin, RST: OutputPin>(
             //let _ = reset.set_low();
         }*/
         Err(mfrc522::Error::Timeout) => {}
+        //Err(mfrc522::Error::Collision) => {
+        /*Err(mfrc522::Error::IncompleteFrame) => {
+            mfrc.spi_reconnect();
+        }*/
         Err(error) => {
             print_serial!("Rfid error: {:?}\r\n", error);
+            reset.set_low();
+            delay.delay_ms(2);
+            reset.set_high();
+            delay.delay_ms(2);
+            mfrc.spi_reconnect();
         }
     }
     false
@@ -133,15 +149,17 @@ fn main() -> ! {
     let spi1 = Spi::<_, _, 8>::new(pac.SPI0).init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
-        1_000_000u32.Hz(),
+        106_000u32.Hz(),
         &MODE_0,
     );
     let spi2 = Spi::<_, _, 8>::new(pac.SPI1).init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
-        1_000_000u32.Hz(),
+        106_000u32.Hz(),
         &MODE_0,
     );
+
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
 
     let mut rst1_pin = pins.gpio0.into_push_pull_output();
     let nss1_pin = pins.gpio1.into_push_pull_output();
@@ -154,8 +172,10 @@ fn main() -> ! {
     let mut mfrc1 = Mfrc522::new(spi1, nss1_pin).unwrap();
     let mut mfrc2 = Mfrc522::new(spi2, nss2_pin).unwrap();
 
-    let mut check_any_rfid =
-        || check_rfid(&mut mfrc1, &mut rst1_pin) || check_rfid(&mut mfrc2, &mut rst2_pin);
+    let mut check_any_rfid = || {
+        check_rfid(&mut mfrc1, &mut rst1_pin, &mut delay)
+            || check_rfid(&mut mfrc2, &mut rst2_pin, &mut delay)
+    };
 
     let mut summer_pin = pins.gpio22.into_push_pull_output();
     let door = pins.gpio28.into_pull_up_input();
@@ -183,6 +203,7 @@ fn main() -> ! {
         let auth = check_any_rfid();
 
         watchdog.feed();
+        let _ = serial.flush();
         if timer.get_counter() - last_timer > 1_000_000 {
             last_timer = timer.get_counter();
             //print_serial!("{state:?}\r");
@@ -194,9 +215,15 @@ fn main() -> ! {
                 armed_indicator_led_pin.set_high().unwrap();
 
                 match (auth, door_is_open) {
-                    (true, _) => State::Snoozed(timer.get_counter() + SNOOZE_INTERVAL),
+                    (true, _) => {
+                        print_serial!("Alarm snoozed\r\n");
+                        State::Snoozed(timer.get_counter() + SNOOZE_INTERVAL)
+                    }
                     (false, false) => State::Armed,
-                    (false, true) => State::Alarming,
+                    (false, true) => {
+                        print_serial!("Intruder detected!!!\r\n");
+                        State::Alarming
+                    }
                 }
             }
             State::Snoozed(timestamp) => {
@@ -204,11 +231,13 @@ fn main() -> ! {
                 armed_indicator_led_pin.set_low().unwrap();
 
                 if timer.get_counter() > timestamp {
-                    print_serial!("arming alarm\r\n");
+                    print_serial!("Alarm armed\r\n");
                     State::Armed
                 } else if door_is_open {
+                    print_serial!("Alarm disarmed\r\n");
                     State::Disarmed
                 } else if auth {
+                    print_serial!("Snooze timer reset\r\n");
                     State::Snoozed(timer.get_counter() + SNOOZE_INTERVAL)
                 } else {
                     State::Snoozed(timestamp)
@@ -219,7 +248,7 @@ fn main() -> ! {
                 armed_indicator_led_pin.set_low().unwrap();
 
                 if !door_is_open {
-                    print_serial!("door closed,snoozing");
+                    print_serial!("Door closed, snoozing\r\n");
                     State::Snoozed(timer.get_counter() + 2_000_000)
                 } else {
                     State::Disarmed
@@ -228,6 +257,7 @@ fn main() -> ! {
             State::Alarming => {
                 if auth {
                     summer_pin.set_low().unwrap();
+                    print_serial!("Alarm disabled\r\n");
                     State::Disarmed
                 } else {
                     //handle alarm here
