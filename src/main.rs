@@ -149,13 +149,13 @@ fn main() -> ! {
     let spi1 = Spi::<_, _, 8>::new(pac.SPI0).init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
-        106_000u32.Hz(),
+        1_000_000u32.Hz(),
         &MODE_0,
     );
     let spi2 = Spi::<_, _, 8>::new(pac.SPI1).init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
-        106_000u32.Hz(),
+        1_000_000u32.Hz(),
         &MODE_0,
     );
 
@@ -163,7 +163,7 @@ fn main() -> ! {
 
     let mut rst1_pin = pins.gpio0.into_push_pull_output();
     let nss1_pin = pins.gpio1.into_push_pull_output();
-    let mut rst2_pin = pins.gpio8.into_push_pull_output();
+    let mut rst2_pin = pins.gpio9.into_push_pull_output();
     let nss2_pin = pins.gpio13.into_push_pull_output();
 
     rst1_pin.set_high().unwrap();
@@ -177,9 +177,9 @@ fn main() -> ! {
             || check_rfid(&mut mfrc2, &mut rst2_pin, &mut delay)
     };
 
-    let mut summer_pin = pins.gpio22.into_push_pull_output();
-    let door = pins.gpio28.into_pull_up_input();
-    let mut armed_indicator_led_pin = pins.gpio15.into_push_pull_output();
+    let mut summer_pin = pins.gpio7.into_push_pull_output();
+    let door = pins.gpio6.into_pull_up_input();
+    let mut armed_indicator_led_pin = pins.gpio8.into_push_pull_output();
 
     let mut state = State::Armed;
     const SNOOZE_INTERVAL: u64 = 1_000_000 * 10; //10 seconds
